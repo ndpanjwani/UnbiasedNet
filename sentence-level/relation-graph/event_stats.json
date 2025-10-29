@@ -1,0 +1,30 @@
+{
+  "total_events": 20400,
+  "events_with_actors": 14678,
+  "events_with_objects": 8826,
+  "events_with_bias": 1968,
+  "top_triggers": {
+    "say": 2225,
+    "make": 406,
+    "tell": 334,
+    "go": 319,
+    "take": 273,
+    "call": 253,
+    "come": 226,
+    "think": 221,
+    "get": 209,
+    "know": 190
+  },
+  "top_actors": {
+    "he": 1424,
+    "I": 805,
+    "who": 592,
+    "that": 578,
+    "it": 369,
+    "they": 353,
+    "He": 335,
+    "we": 316,
+    "she": 269,
+    "Trump": 213
+  }
+}

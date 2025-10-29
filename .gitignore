@@ -1,0 +1,31 @@
+# -----------------------------
+# 🧩 Python environment & build
+# -----------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# -----------------------------
+# 🧠 IDE / OS clutter
+# -----------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# -----------------------------
+# 🧬 Data & intermediate outputs
+# -----------------------------
+# Raw datasets and large intermediate files
+data-preprocessing/BASIL/
+sentence-level/news-discourse/Discoure_Profiling_RL_EMNLP21Findings

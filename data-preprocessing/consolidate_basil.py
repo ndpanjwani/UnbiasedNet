@@ -4,11 +4,6 @@ BASIL Dataset Consolidation Script
 This script combines articles and annotations from the BASIL dataset into a single
 consolidated format suitable for training bias detection models.
 
-The script:
-1. Matches articles with their corresponding annotation files using UUID
-2. Extracts sentences from article paragraphs
-3. Maps phrase-level annotations to their corresponding sentences
-4. Creates a consolidated output format with sentence-level annotations
 """
 
 import json
