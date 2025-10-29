@@ -23,9 +23,8 @@ Thumbs.db
 *.swp
 *.swo
 
-# -----------------------------
-# 🧬 Data & intermediate outputs
-# -----------------------------
-# Raw datasets and large intermediate files
+
 data-preprocessing/BASIL/
 sentence-level/news-discourse/Discoure_Profiling_RL_EMNLP21Findings
+sentence-level/news-discourse/.venv
+sentence-level/news-discourse/checkpoints
