@@ -4,6 +4,18 @@ from textblob import TextBlob
 from tqdm import tqdm
 from collections import Counter
 
+#NEXT STEP -- MAKE MORE DYNAMIC 
+
+# Article text
+#    ↓
+# Sentence segmentation (spaCy or Stanza)
+#    ↓
+# [Dynamic model]
+#    ↳  (a) trigger detection  → find event words
+#    ↳  (b) argument labeling → who did what, to whom
+#    ↳  (c) event coref / merging
+#    ↓
+# JSON: [{trigger, actor, object, sentiment, role, ...}]
 # -------------------------------
 # Load model
 # -------------------------------
