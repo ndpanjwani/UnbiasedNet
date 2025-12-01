@@ -32,6 +32,7 @@ Nodes include **sentence nodes** (containing text and discourse data) and **even
 Edges connect sentences to their events, events to related events, and adjacent sentences.  
 This structure links rhetorical framing with factual context.
 
+**TEST: VISUALIZE A GRAPH**
 ---
 
 ## **Step 5. Feature Encoding**
@@ -39,6 +40,8 @@ Assign interpretable features to each node:
 - **Sentence nodes:** sentence embeddings, discourse role embeddings, and aggregate event statistics (e.g., event count, mean sentiment).  
 - **Event nodes:** trigger embeddings, actor names, sentiment polarity, and relation degree.  
 These features provide both linguistic and contextual signals for bias detection.
+
+**TEST: Train a simple classifier (ex logistic regression) on the node features to predict has_bias.**
 
 ---
 

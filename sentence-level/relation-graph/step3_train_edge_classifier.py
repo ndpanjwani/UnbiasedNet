@@ -1,310 +1,351 @@
-import json
-import re
-import numpy as np
+import json, re, random, numpy as np
 from tqdm import tqdm
 from collections import defaultdict, Counter
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-import pickle
-from sentence_transformers import SentenceTransformer
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    Trainer, TrainingArguments, EvalPrediction
+)
+import torch
+from sklearn.metrics import f1_score, precision_recall_curve
 
 # -------------------------------
-# Global configs
+# Helpers to align with SRL step-2
 # -------------------------------
-EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+def get_actor(ev):
+    return ev.get("actor") or ev.get("ARG0") or ev.get("args", {}).get("ARG0")
 
-DISCOURSE_WEIGHTS = {
-    "Main": 1.0,
-    "Main_Consequence": 0.9,
-    "Cause_General": 0.8,
-    "Cause_Specific": 0.8,
-    "Distant_Historical": 0.5,
-    "Distant_Anecdotal": 0.5,
-    "Distant_Evaluation": 0.6,
-    "Distant_Expectation": 0.6,
-    "NONE": 0.3
-}
+def get_object(ev):
+    return ev.get("object") or ev.get("ARG1") or ev.get("args", {}).get("ARG1")
 
-# -------------------------------
-# Feature extraction for event pairs
-# -------------------------------
-def extract_pair_features(e1, e2, sent1, sent2, sent_distance):
-    """Extract features for an event pair."""
-    features = {}
-
-    # === Distance features ===
-    features["sent_distance"] = sent_distance
-    features["is_adjacent"] = 1 if sent_distance == 1 else 0
-    features["is_nearby"] = 1 if sent_distance <= 2 else 0
-
-    # === Discourse features ===
-    role1 = sent1.get("discourse_role", "NONE")
-    role2 = sent2.get("discourse_role", "NONE")
-    features["src_discourse_weight"] = DISCOURSE_WEIGHTS.get(role1, 0.5)
-    features["tgt_discourse_weight"] = DISCOURSE_WEIGHTS.get(role2, 0.5)
-    features["discourse_diff"] = abs(
-        features["src_discourse_weight"] - features["tgt_discourse_weight"]
-    )
-    features["is_cause_to_main"] = (
-        1 if role1 in ["Cause_General", "Cause_Specific"] and role2 == "Main" else 0
-    )
-    features["is_main_to_consequence"] = (
-        1 if role1 == "Main" and role2 == "Main_Consequence" else 0
-    )
-    features["both_main"] = 1 if role1 == "Main" and role2 == "Main" else 0
-
-    # === Entity overlap ===
-    entities1 = {e1.get("actor"), e1.get("object")} - {None}
-    entities2 = {e2.get("actor"), e2.get("object")} - {None}
-    shared = entities1 & entities2
-    features["has_shared_entity"] = 1 if shared else 0
-    features["num_shared_entities"] = len(shared)
-    features["same_actor"] = (
-        1 if e1.get("actor") and e1.get("actor") == e2.get("actor") else 0
-    )
-    features["same_object"] = (
-        1 if e1.get("object") and e1.get("object") == e2.get("object") else 0
-    )
-
-    # === Trigger and semantic features ===
-    features["same_trigger"] = 1 if e1.get("trigger") == e2.get("trigger") else 0
-    e1_trigger, e2_trigger = e1.get("trigger", ""), e2.get("trigger", "")
-    try:
-        e1_emb = EMBED_MODEL.encode(e1_trigger, normalize_embeddings=True)
-        e2_emb = EMBED_MODEL.encode(e2_trigger, normalize_embeddings=True)
-        features["trigger_similarity"] = float(np.dot(e1_emb, e2_emb))
-    except Exception:
-        features["trigger_similarity"] = 0.0
-
-    # === Sentiment features ===
-    s1_val, s2_val = e1.get("sentiment", 0), e2.get("sentiment", 0)
-    features["sentiment_diff"] = abs(s1_val - s2_val)
-    features["sentiment_product"] = s1_val * s2_val
-    features["both_negative"] = 1 if s1_val < -0.1 and s2_val < -0.1 else 0
-    features["both_positive"] = 1 if s1_val > 0.1 and s2_val > 0.1 else 0
-
-    # === Bias features ===
-    features["src_has_bias"] = 1 if sent1.get("has_bias", False) else 0
-    features["tgt_has_bias"] = 1 if sent2.get("has_bias", False) else 0
-    features["both_have_bias"] = (
-        1 if sent1.get("has_bias") and sent2.get("has_bias") else 0
-    )
-
-    # === Lexical features ===
-    text_pair = (sent1.get("text", "") + " " + sent2.get("text", "")).lower()
-    features["has_causal_marker"] = 1 if re.search(
-        r"\b(because|due to|led to|caused|resulted|therefore|hence)\b", text_pair
-    ) else 0
-    features["has_temporal_marker"] = 1 if re.search(
-        r"\b(before|after|then|when|since|while|subsequently)\b", text_pair
-    ) else 0
-    features["has_conditional_marker"] = 1 if re.search(
-        r"\b(if|unless|provided|assuming)\b", text_pair
-    ) else 0
-    features["has_contrast_marker"] = 1 if re.search(
-        r"\b(but|however|although|yet|nevertheless)\b", text_pair
-    ) else 0
-
-    return features
+def get_trigger(ev):
+    return ev.get("trigger") or ev.get("lemma") or ev.get("predicate")
 
 
 # -------------------------------
-# Heuristic weak labels
+# Detect weak relations (with SRL support)
 # -------------------------------
-def get_heuristic_label(e1, e2, sent1, sent2, sent_distance, f):
-    """Weak labeling function for training data."""
-    # strong causal
-    if f["is_cause_to_main"] and f["has_causal_marker"]:
-        return 1, "causal"
-    # temporal
-    if f["is_main_to_consequence"] and sent_distance <= 2:
-        return 1, "temporal"
-    # coreference
-    if f["same_trigger"] and f["same_actor"] and sent_distance <= 2:
-        return 1, "coreference"
-    # same actor, adjacent
-    if f["same_actor"] and f["is_adjacent"] and not f["same_trigger"]:
-        return 1, "temporal"
-    # both main and shared entity
-    if f["both_main"] and f["has_shared_entity"] and sent_distance <= 2:
-        return 1, "continuation"
-    # fallback strong cause
-    if f["is_cause_to_main"] and sent_distance <= 3:
-        return 1, "causal"
+def detect_relation_type(e1, e2, s1, s2, dist):
+    txt_pair = (s1.get("text","") + " " + s2.get("text","")).lower()
+    role1 = s1.get("discourse_role", "NONE")
+    role2 = s2.get("discourse_role", "NONE")
 
-    # negatives
-    if sent_distance > 4:
-        return 0, "none"
-    if not f["has_shared_entity"] and sent_distance > 1 and np.random.random() < 0.3:
-        return 0, "none"
-    return 0, "none"
+    e1_trigger, e2_trigger = get_trigger(e1), get_trigger(e2)
+    e1_actor,   e2_actor   = get_actor(e1),  get_actor(e2)
+    e1_obj,     e2_obj     = get_object(e1), get_object(e2)
+
+    # ---- Causal
+    has_causal = bool(re.search(r"\b(because|due to|caused|led to|therefore|hence|resulted|consequently)\b", txt_pair))
+    is_cause_to_main = role1 in ["Cause_General", "Cause_Specific"] and role2 == "Main"
+
+    if has_causal and is_cause_to_main:
+        return "causal", 0.95
+    if has_causal and dist <= 2:
+        return "causal", 0.85
+    if is_cause_to_main:
+        return "causal", 0.75
+
+    # ---- Temporal
+    has_temp = bool(re.search(r"\b(before|after|then|since|while|subsequently|meanwhile|following)\b", txt_pair))
+    if role1 == "Main" and role2 == "Main_Consequence":
+        return "temporal", 0.9
+    if has_temp and dist <= 2:
+        return "temporal", 0.8
+
+    # ---- Coreference (SRL-friendly)
+    if (
+        e1_trigger == e2_trigger and
+        e1_actor is not None and e1_actor == e2_actor and
+        dist <= 2
+    ):
+        return "coreference", 0.95
+
+    # ---- Continuation (same actor)
+    if e1_actor and e1_actor == e2_actor and e1_trigger != e2_trigger and dist <= 2:
+        return "continuation", 0.8
+
+    # ---- Weak continuation via shared entities
+    ents1 = {e1_actor, e1_obj} - {None}
+    ents2 = {e2_actor, e2_obj} - {None}
+    if (ents1 & ents2) and dist <= 3:
+        return "continuation", 0.65
+
+    # ---- Default none
+    if dist > 4:
+        return "none", 0.9
+    return "none", 0.6
 
 
 # -------------------------------
-# Create weakly labeled dataset
+# Create training pairs (with negative sampling)
 # -------------------------------
-def create_training_data(data, max_samples_per_article=60):
-    """Generate event pairs and weak labels."""
+def create_training_data_text(data, max_samples_per_article=60, min_confidence=0.6):
     articles = defaultdict(list)
-    for idx, sent in enumerate(data):
-        sent["sentence_idx"] = idx
-        articles[sent["article_id"]].append(sent)
+    for i, s in enumerate(data):
+        s["sentence_idx"] = i
+        articles[s["article_id"]].append(s)
 
-    X, y, edge_types = [], [], []
-    print("🧩 Creating training pairs...")
+    pairs, stats = [], Counter()
 
-    for article_id, sents in tqdm(list(articles.items())[:100]):
+    for aid, sents in tqdm(list(articles.items())[:200], desc="Pairing events"):
         sents = sorted(sents, key=lambda x: x["sentence_idx"])
-        events = []
-        for s in sents:
-            for ev in s.get("events", []):
-                events.append({"event": ev, "sentence": s})
+        events = [{"event": ev, "sentence": s} for s in sents for ev in s.get("events", [])]
+
         sampled = 0
         for i, e1_ctx in enumerate(events):
             if sampled >= max_samples_per_article:
                 break
-            for j in range(i + 1, min(i + 8, len(events))):
+
+            for j in range(i+1, min(i+8, len(events))):
                 e1, e2 = e1_ctx["event"], events[j]["event"]
                 s1, s2 = e1_ctx["sentence"], events[j]["sentence"]
                 dist = abs(s1["sentence_idx"] - s2["sentence_idx"])
-                feats = extract_pair_features(e1, e2, s1, s2, dist)
-                label, etype = get_heuristic_label(e1, e2, s1, s2, dist, feats)
-                X.append(list(feats.values()))
-                y.append(label)
-                edge_types.append(etype)
+                if dist > 5: 
+                    continue
+
+                label, conf = detect_relation_type(e1, e2, s1, s2, dist)
+                if conf < min_confidence:
+                    continue
+
+                # Build improved text representation
+                text1 = (
+                    f"Sentence: {s1['text']} "
+                    f"Trigger: {get_trigger(e1)} "
+                    f"ARG0: {get_actor(e1)} ARG1: {get_object(e1)} "
+                    f"Discourse: {s1.get('discourse_role','NONE')}"
+                )
+                text2 = (
+                    f"Sentence: {s2['text']} "
+                    f"Trigger: {get_trigger(e2)} "
+                    f"ARG0: {get_actor(e2)} ARG1: {get_object(e2)} "
+                    f"Discourse: {s2.get('discourse_role','NONE')}"
+                )
+
+                pairs.append({
+                    "text1": text1,
+                    "text2": text2,
+                    "label": LABEL2ID[label],
+                    "confidence": conf
+                })
+
+                stats[label] += 1
                 sampled += 1
 
-    feat_names = list(
-        extract_pair_features(
-            {"trigger": "a"}, {"trigger": "b"},
-            {"discourse_role": "NONE"}, {"discourse_role": "NONE"}, 1
-        ).keys()
+                # --- 🔥 Negative sampling (strengthens "none")
+                if random.random() < 0.25:
+                    pairs.append({
+                        "text1": f"Sentence: {s1['text']}",
+                        "text2": f"Sentence: {s2['text']}",
+                        "label": LABEL2ID["none"],
+                        "confidence": 0.95
+                    })
+                    stats["none"] += 1
+
+    print("\n📊 Weak-label distribution (after negative sampling):")
+    for l, c in sorted(stats.items(), key=lambda x: -x[1]):
+        print(f"  {l:15s}: {c:5d}")
+    return pairs
+
+
+# --------------------------------------------------------
+# Everything else (training, threshold search, build graph)
+# remains unchanged
+# --------------------------------------------------------
+
+# -------------------------------
+# Metrics
+# -------------------------------
+def compute_metrics(eval_pred: EvalPrediction):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "accuracy": (preds == labels).mean(),
+        "macro_f1": f1_score(labels, preds, average="macro")
+    }
+
+
+# -------------------------------
+# Train the transformer model
+# -------------------------------
+def train_transformer_relation_model(pairs, model_name="roberta-base", output_dir="./relation_model"):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=len(RELATION_LABELS), id2label=ID2LABEL, label2id=LABEL2ID
     )
-    return np.array(X), np.array(y), feat_names, edge_types
 
+    ds = Dataset.from_list(pairs).shuffle(seed=42)
+    split = ds.train_test_split(test_size=0.15, seed=42)
+    tokenized = split.map(lambda e: tokenizer(e["text1"], e["text2"], truncation=True, padding="max_length", max_length=256), batched=True)
 
-# -------------------------------
-# Train edge classifier
-# -------------------------------
-def train_edge_classifier(data):
-    print("🎓 Training Random Forest classifier...")
-    X, y, feat_names, edge_types = create_training_data(data)
-
-    print(f"Samples: {len(X)}  Positives: {sum(y)} ({sum(y)/len(y)*100:.1f}%)")
-
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-    clf = RandomForestClassifier(
-        n_estimators=120,
-        max_depth=12,
-        min_samples_split=8,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1,
+    args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=5,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=32,
+        learning_rate=2e-5,
+        weight_decay=0.01,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="macro_f1",
+        logging_dir="./logs",
+        report_to="none",
+        save_total_limit=2
     )
-    clf.fit(Xtr, ytr)
-    print(f"Train acc: {clf.score(Xtr, ytr):.3f}  Test acc: {clf.score(Xte, yte):.3f}")
 
-    print("\n🔝 Top features:")
-    for f, imp in sorted(zip(feat_names, clf.feature_importances_), key=lambda x: -x[1])[:10]:
-        print(f"  {f:25s}: {imp:.3f}")
-    return clf, feat_names
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=tokenized["train"],
+        eval_dataset=tokenized["test"],
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics
+    )
+
+    print("\n🚀 Training transformer...")
+    trainer.train()
+    results = trainer.evaluate()
+    print("\n📊 Eval results:", results)
+
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"✅ Saved model → {output_dir}")
+    return trainer, tokenized
 
 
 # -------------------------------
-# Apply classifier to build ERG
+# Threshold selection
 # -------------------------------
-def infer_relation_type(f):
-    if f["same_trigger"] and f["same_actor"]:
-        return "coreference"
-    elif f["is_cause_to_main"] or f["has_causal_marker"]:
-        return "causal"
-    elif f["is_main_to_consequence"] or f["has_temporal_marker"]:
-        return "temporal"
-    elif f["has_contrast_marker"]:
-        return "contrast"
-    elif f["same_actor"]:
-        return "continuation"
-    else:
-        return "related"
+def find_optimal_threshold(trainer, tokenizer, model, val_dataset):
+    model.eval()
+    probs_all, labels_all = [], []
+    dl = trainer.get_eval_dataloader(val_dataset)
+    device = next(model.parameters()).device
+
+    for batch in dl:
+        inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        probs_all.append(probs)
+        labels_all.extend(batch["labels"].cpu().numpy())
+
+    probs_all = np.concatenate(probs_all, axis=0)
+    labels_all = np.array(labels_all)
+    edge_conf = 1.0 - probs_all[:, LABEL2ID["none"]]
+    y_true = (labels_all != LABEL2ID["none"]).astype(int)
+
+    precision, recall, thr = precision_recall_curve(y_true, edge_conf)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    best_thr = thr[np.argmax(f1)]
+
+    print(f"\n🔍 Optimal confidence threshold (by F1): {best_thr:.3f}")
+    return float(best_thr)
 
 
-def build_event_relations_with_classifier(data, clf, feat_names, threshold=0.6):
+# -------------------------------
+# Build ERG edges (unchanged except SRL fixes)
+# -------------------------------
+def build_graph_with_model(data, model_path="./relation_model", confidence_threshold=0.7):
+    print(f"\n📊 Building graph with model (threshold={confidence_threshold})...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    model.eval()
+
     articles = defaultdict(list)
-    for idx, s in enumerate(data):
-        s["sentence_idx"] = idx
+    for i, s in enumerate(data):
+        s["sentence_idx"] = i
         articles[s["article_id"]].append(s)
 
-    edges = []
-    print(f"⚙️ Building ERG edges (thr={threshold})...")
-    for aid, sents in tqdm(articles.items()):
+    edges, stats = [], Counter()
+    for aid, sents in tqdm(articles.items(), desc="Building graph"):
         sents = sorted(sents, key=lambda x: x["sentence_idx"])
-        evs = []
-        for s in sents:
-            for ev in s.get("events", []):
-                evs.append({"event": ev, "sentence": s})
-        for i, e1_ctx in enumerate(evs):
-            for j in range(i + 1, min(i + 8, len(evs))):
-                e1, e2 = e1_ctx["event"], evs[j]["event"]
-                s1, s2 = e1_ctx["sentence"], evs[j]["sentence"]
+        events = [{"event": ev, "sentence": s} for s in sents for ev in s.get("events", [])]
+
+        for i, e1_ctx in enumerate(events):
+            for j in range(i+1, min(i+8, len(events))):
+                e1, e2 = e1_ctx["event"], events[j]["event"]
+                s1, s2 = e1_ctx["sentence"], events[j]["sentence"]
                 dist = abs(s1["sentence_idx"] - s2["sentence_idx"])
                 if dist > 5:
                     continue
-                feats = extract_pair_features(e1, e2, s1, s2, dist)
-                fv = np.array([list(feats.values())])
-                prob = clf.predict_proba(fv)[0][1]
-                if prob >= threshold:
-                    rel = infer_relation_type(feats)
-                    e1_id = f"{aid}_{s1['sentence_idx']}_{e1['trigger']}_{i}"
-                    e2_id = f"{aid}_{s2['sentence_idx']}_{e2['trigger']}_{j}"
+
+                text1 = (
+                    f"Sentence: {s1['text']} "
+                    f"Trigger: {get_trigger(e1)} "
+                    f"ARG0: {get_actor(e1)} ARG1: {get_object(e1)} "
+                    f"Discourse: {s1.get('discourse_role','NONE')}"
+                )
+                text2 = (
+                    f"Sentence: {s2['text']} "
+                    f"Trigger: {get_trigger(e2)} "
+                    f"ARG0: {get_actor(e2)} ARG1: {get_object(e2)} "
+                    f"Discourse: {s2.get('discourse_role','NONE')}"
+                )
+
+                inputs = tokenizer(text1, text2, return_tensors="pt", truncation=True, max_length=256).to(model.device)
+
+                with torch.no_grad():
+                    probs = torch.softmax(model(**inputs).logits, dim=-1)[0].cpu().numpy()
+
+                order = np.argsort(-probs)
+                top1, top2 = order[0], order[1]
+
+                pred_label = top1
+                confidence = probs[top1]
+
+                # Fallback: promote top2 if "none" dominates
+                if ID2LABEL[top1] == "none" and probs[top2] > 0.3 and ID2LABEL[top2] != "none":
+                    pred_label = top2
+                    confidence = probs[top2]
+
+                relation = ID2LABEL[pred_label]
+                stats[relation] += 1
+
+                if confidence >= confidence_threshold and relation != "none":
+                    e1_id = f"{aid}_{s1['sentence_idx']}_{get_trigger(e1)}_{i}"
+                    e2_id = f"{aid}_{s2['sentence_idx']}_{get_trigger(e2)}_{j}"
                     edges.append({
                         "article_id": aid,
                         "src_event_id": e1_id,
-                        "src_trigger": e1["trigger"],
                         "tgt_event_id": e2_id,
-                        "tgt_trigger": e2["trigger"],
-                        "relation": rel,
-                        "confidence": round(float(prob), 3),
+                        "src_trigger": get_trigger(e1),
+                        "tgt_trigger": get_trigger(e2),
+                        "relation": relation,
+                        "confidence": round(float(confidence), 3),
                         "sentence_distance": dist
                     })
+
+    print(f"\n✅ Built graph with {len(edges)} edges")
+    print("Relation counts:")
+    for rel, c in stats.items():
+        print(f"{rel:15s}: {c}")
+
     return edges
 
 
 # -------------------------------
-# Main pipeline
+# Main
 # -------------------------------
 def main():
-    input_path = "/Users/nainapanjwani/444/UnbiasedNet/sentence-level/relation-graph/discourse_with_events.json"
-    model_path = "/Users/nainapanjwani/444/UnbiasedNet/sentence-level/relation-graph/edge_classifier.pkl"
-    output_path = "/Users/nainapanjwani/444/UnbiasedNet/sentence-level/relation-graph/erg_edges_learned.json"
+    input_path = "discourse_with_events.json"
+    model_dir = "./relation_model"
+    output_edges = "erg_edges_transformer.json"
 
     print("📘 Loading data...")
     with open(input_path) as f:
         data = json.load(f)
 
-    try:
-        with open(model_path, "rb") as f:
-            clf, feat_names = pickle.load(f)
-        print("✅ Loaded existing classifier")
-    except FileNotFoundError:
-        print("⚙️ Training new classifier...")
-        clf, feat_names = train_edge_classifier(data)
-        with open(model_path, "wb") as f:
-            pickle.dump((clf, feat_names), f)
-        print(f"💾 Saved model → {model_path}")
+    pairs = create_training_data_text(data)
+    trainer, tokenized = train_transformer_relation_model(pairs, output_dir=model_dir)
+    best_thr = find_optimal_threshold(trainer, trainer.tokenizer, trainer.model, tokenized["test"])
 
-    for thr in [0.5, 0.6, 0.7]:
-        print(f"\n{'='*60}\n Building with threshold={thr}\n{'='*60}")
-        edges = build_event_relations_with_classifier(data, clf, feat_names, thr)
-        print(f"Edges: {len(edges)}")
-        rel_counts = Counter(e["relation"] for e in edges)
-        for r, c in rel_counts.most_common():
-            print(f"  {r:15s}: {c:5d}")
-
-    optimal = 0.6
-    edges = build_event_relations_with_classifier(data, clf, feat_names, optimal)
-    with open(output_path, "w") as f:
+    edges = build_graph_with_model(data, model_path=model_dir, confidence_threshold=best_thr)
+    with open(output_edges, "w") as f:
         json.dump(edges, f, indent=2, ensure_ascii=False)
-    print(f"\n✅ Saved {len(edges)} edges → {output_path}")
+
+    print(f"\n💾 Saved edges → {output_edges}")
 
 
 if __name__ == "__main__":
